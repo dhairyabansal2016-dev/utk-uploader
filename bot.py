@@ -1,130 +1,203 @@
-import os, re, requests, yt_dlp, asyncio, time, shutil, json
-from http.server import BaseHTTPRequestHandler, HTTPServer
+import os
+import requests
+import logging
+from flask import Flask
 from threading import Thread
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler, CallbackQueryHandler
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 
-# --- CONFIGURATION ---
-BOT_TOKEN = os.getenv("BOT_TOKEN") 
-GET_FILE, GET_QUALITY, GET_NAME = range(3)
-DB_FILE = "resume_data.json"
+# --- FLASK HEARTBEAT SECTION ---
+app = Flask('')
 
-# --- HEALTH CHECK SERVER (For UptimeRobot) ---
-class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200); self.end_headers()
-        self.wfile.write(b"ALIVE")
+@app.route('/')
+def home():
+    return "Bot is Online"
 
-def run_server():
-    port = int(os.getenv("PORT", 8080))
-    HTTPServer(('0.0.0.0', port), HealthHandler).serve_forever()
+def run_flask():
+    # Render automatically provides the PORT environment variable
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host='0.0.0.0', port=port)
 
-# --- DATABASE & PARSER ---
-def load_db():
-    if os.path.exists(DB_FILE):
+def keep_alive():
+    t = Thread(target=run_flask)
+    t.daemon = True
+    t.start()
+
+# --- BOT LOGIC SECTION ---
+# Use Env Var for token, fallback to your hardcoded one for now
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8420197585:AAFMuzgaetEsUA9zo2FQlOKZlY2E5__gYMo")
+
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+class SelectionWayBot:
+    def __init__(self):
+        self.base_headers = {
+            "sec-ch-ua-platform": "\"Windows\"",
+            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
+            "content-type": "application/json",
+            "accept": "*/*",
+            "origin": "https://www.selectionway.com",
+            "referer": "https://www.selectionway.com/",
+            "accept-language": "en-US,en;q=0.9",
+        }
+        self.user_sessions = {}
+
+    def clean_url(self, url):
+        if not url: return ""
+        return url.replace(" ", "%")
+
+    async def get_all_batches(self):
+        courses_url = "https://backend.multistreaming.site/api/courses/active?userId=1448640"
         try:
-            with open(DB_FILE, 'r') as f: return json.load(f)
-        except: return {}
-    return {}
-
-def save_db(f_name, idx, h_id=None):
-    db = load_db()
-    db[f_name] = {"idx": idx, "h_id": h_id or db.get(f_name, {}).get("h_id")}
-    with open(DB_FILE, 'w') as f: json.dump(db, f)
-
-def parse_txt(path):
-    out, curr = [], "General"
-    with open(path, 'r', encoding='utf-8') as f:
-        for line in f:
-            line = line.strip()
-            if not line: continue
-            tm = re.match(r"^\[(.*?)\]", line)
-            if tm: curr = tm.group(1); line = line[tm.end():].strip()
-            if " : " in line:
-                p = line.split(" : ", 1)
-                out.append({"topic": curr, "title": p[0].strip(), "url": p[1].strip()})
-    return out
-
-# --- CONVERSATION FLOW ---
-async def start_upload(u, c):
-    await u.message.reply_text("📂 **UPLOAD TXT FILE:**")
-    return GET_FILE
-
-async def receive_file(u, c):
-    doc = u.message.document
-    if not doc.file_name.endswith(".txt"):
-        await u.message.reply_text("❌ Send a .txt file!"); return GET_FILE
-    c.user_data['f_id'], c.user_data['f_name'] = doc.file_id, doc.file_name
-    kb = [[InlineKeyboardButton("480p", callback_data='480'), InlineKeyboardButton("720p", callback_data='720')]]
-    await u.message.reply_text("🎬 **QUALITY:**", reply_markup=InlineKeyboardMarkup(kb))
-    return GET_QUALITY
-
-async def receive_quality(u, c):
-    q = u.callback_query; await q.answer(); c.user_data['q'] = q.data
-    await q.edit_message_text(f"✅ {q.data}p selected.\n👤 **ENTER EXTRACTOR NAME:**")
-    return GET_NAME
-
-async def receive_name(u, c):
-    ex_name = u.message.text
-    qual, f_name = c.user_data['q'], c.user_data['f_name']
-    batch = f_name.replace(".txt", "")
-    
-    file = await c.bot.get_file(c.user_data['f_id'])
-    await file.download_to_drive(f_name)
-    content = parse_txt(f_name)
-    
-    db = load_db().get(f_name, {"idx": 0, "h_id": None})
-    last_idx, h_id = db["idx"], db["h_id"]
-
-    if not h_id:
-        msg = await c.bot.send_message(u.effective_chat.id, f"📦 **BATCH: {batch}**\n👤 By: {ex_name}\n🎬 Qual: {qual}p\n📊 Total: {len(content)}")
-        h_id = msg.message_id
-        try: await c.bot.pin_chat_message(u.effective_chat.id, h_id)
-        except: pass
-        save_db(f_name, 0, h_id)
-
-    status = await u.message.reply_text("🚀 Starting sequence...")
-    
-    for i, item in enumerate(content, 1):
-        if i <= last_idx: continue
-        if i % 20 == 0: await asyncio.sleep(30) # Flood Protection
-
-        try:
-            work_dir = os.path.abspath("work")
-            if os.path.exists(work_dir): shutil.rmtree(work_dir)
-            os.makedirs(work_dir, exist_ok=True)
-            v_path, t_path = os.path.join(work_dir, "v.mp4"), os.path.join(work_dir, "t.jpg")
-            
-            # Download
-            with yt_dlp.YoutubeDL({'format': f'bestvideo[height<={qual}]+bestaudio/best', 'outtmpl': v_path, 'quiet': True}) as ydl:
-                ydl.download([item['url']])
-            
-            # Thumbnail
-            os.system(f'ffmpeg -i "{v_path}" -ss 00:00:05 -vframes 1 "{t_path}" -y -loglevel quiet')
-            
-            # Upload
-            cap = f"Index: {i}\nTitle: {item['title']}\nTopic: {item['topic']}\nBatch: {batch}"
-            with open(v_path, 'rb') as video_file, open(t_path, 'rb') as thumb_file:
-                await c.bot.send_video(u.effective_chat.id, video=video_file, thumbnail=thumb_file, caption=cap, supports_streaming=True, write_timeout=120)
-            
-            save_db(f_name, i)
-            await status.edit_text(f"✅ Progress: {i}/{len(content)}")
+            response = requests.get(courses_url, headers=self.base_headers)
+            response.raise_for_status()
+            data = response.json()
+            return (True, data["data"]) if data.get("state") == 200 else (False, "Failed to get batches")
         except Exception as e:
-            await u.message.reply_text(f"⚠️ Skip {i}: {str(e)[:100]}")
+            return False, str(e)
 
-    await c.bot.edit_message_text(f"📂 **BATCH: {batch}**", u.effective_chat.id, h_id)
-    await u.message.reply_text("🏁 **BATCH COMPLETED SUCCESSFULLY!**")
-    return ConversationHandler.END
+    async def login_user(self, email, password, user_id):
+        login_url = "https://selectionway.hranker.com/admin/api/user-login"
+        login_data = {
+            "email": email, "password": password,
+            "mobile": "", "otp": "", "logged_in_via": "web", "customer_id": 561
+        }
+        try:
+            session = requests.Session()
+            response = session.post(login_url, headers=self.base_headers, json=login_data)
+            res = response.json()
+            if res.get("state") == 200:
+                self.user_sessions[user_id] = {
+                    'user_id': res["data"]["user_id"],
+                    'token': res["data"]["token_id"],
+                    'session': session
+                }
+                return True, "✅ Login successful!"
+            return False, "❌ Invalid credentials"
+        except Exception as e:
+            return False, f"❌ Error: {str(e)}"
 
-# --- MAIN ---
+    async def get_my_batches(self, user_id):
+        if user_id not in self.user_sessions: return False, "Please login first"
+        user_data = self.user_sessions[user_id]
+        url = "https://backend.multistreaming.site/api/courses/my-courses"
+        try:
+            response = user_data['session'].post(url, headers=self.base_headers, json={"userId": str(user_data['user_id'])})
+            res = response.json()
+            return (True, res["data"]) if res.get("state") == "200" else (False, "Failed to get courses")
+        except Exception as e:
+            return False, str(e)
+
+    async def extract_course_data_without_login(self, course_id, course_name):
+        url = f"https://backend.multistreaming.site/api/courses/{course_id}/classes?populate=full"
+        try:
+            response = requests.get(url, headers=self.base_headers)
+            res = response.json()
+            if res.get("state") == 200:
+                return True, {"classes_data": res["data"], "pdf_url": "", "course_details": {"title": course_name}}
+            return False, "Failed to get data"
+        except Exception as e:
+            return False, str(e)
+
+    def extract_all_data(self, classes_data, pdf_url, course_details):
+        video_links = []
+        pdf_links = [f"Batch Info PDF : {pdf_url}"] if pdf_url else []
+        if classes_data and "classes" in classes_data:
+            for topic in classes_data["classes"]:
+                for item in topic.get("classes", []):
+                    title = item.get("title", "Video")
+                    best_url = item.get("class_link", "")
+                    recs = item.get("mp4Recordings", [])
+                    qualities = ["720p", "480p", "360p"]
+                    for q in qualities:
+                        for r in recs:
+                            if r.get("quality") == q:
+                                best_url = r.get("url")
+                                title = f"{title} ({q})"
+                                break
+                        if "720p" in title or "480p" in title: break
+                    if best_url: video_links.append(f"{title} : {best_url}")
+        return video_links, pdf_links
+
+    def create_file(self, name, videos, pdfs):
+        filename = f"{name.replace(' ', '_')}.txt"
+        with open(filename, 'w', encoding='utf-8') as f:
+            f.write(f"🎯 {name}\n\n📄 PDFs:\n" + "\n".join(pdfs) + "\n\n🎥 VIDEOS:\n" + "\n".join(videos))
+        return filename
+
+bot = SelectionWayBot()
+
+# --- HANDLERS ---
+async def start(update, context):
+    keyboard = [[InlineKeyboardButton("🔐 Login & Extract", callback_data="login_extract")],
+                [InlineKeyboardButton("📚 List All Batches", callback_data="list_batches")]]
+    await update.message.reply_text("🤖 *SelectionWay Extractor Bot*", 
+                                  reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+
+async def button_handler(update, context):
+    query = update.callback_query
+    await query.answer()
+    if query.data == "login_extract":
+        context.user_data['awaiting_login'] = True
+        await query.edit_message_text("🔐 Send credentials as `email:password`", parse_mode='Markdown')
+    elif query.data == "list_batches":
+        success, result = await bot.get_all_batches()
+        if success:
+            msg = "📚 *Available Batches*\n\n"
+            batch_list = []
+            for i, c in enumerate(result[:20], 1): # Limit to 20 for message length
+                msg += f"{i}. {c.get('title')}\nID: `{c.get('id')}`\n\n"
+                batch_list.append(c)
+            context.user_data.update({'all_batches': batch_list, 'awaiting_batch_id': True})
+            await query.edit_message_text(msg + "👉 Send *Batch ID* to extract", parse_mode='Markdown')
+
+async def handle_message(update, context):
+    text = update.message.text
+    uid = update.message.from_user.id
+    
+    if context.user_data.get('awaiting_login'):
+        if ":" in text:
+            email, pw = text.split(":", 1)
+            success, msg = await bot.login_user(email.strip(), pw.strip(), uid)
+            if success:
+                context.user_data['awaiting_login'] = False
+                # Fetch user batches
+                s, my_b = await bot.get_my_batches(uid)
+                if s:
+                    res_msg = "✅ Your Batches:\n\n"
+                    b_list = []
+                    # Simple flattening for my_batches
+                    for group in my_b:
+                        for c in group.get("liveCourses", []) + group.get("recordedCourses", []):
+                            b_list.append(c)
+                            res_msg += f"{len(b_list)}. {c.get('title')}\n"
+                    context.user_data.update({'my_batches': b_list, 'awaiting_batch_selection': True})
+                    await update.message.reply_text(res_msg + "👉 Reply with Batch Number")
+            else: await update.message.reply_text(msg)
+
+    elif context.user_data.get('awaiting_batch_id'):
+        bid = text.strip()
+        await update.message.reply_text("🔄 Extracting...")
+        s, res = await bot.extract_course_data_without_login(bid, "Extracted Course")
+        if s:
+            v, p = bot.extract_all_data(res["classes_data"], res["pdf_url"], res["course_details"])
+            fname = bot.create_file("Course", v, p)
+            with open(fname, 'rb') as f:
+                await update.message.reply_document(f, caption=f"✅ Extracted {len(v)} videos")
+            os.remove(fname)
+
+def main():
+    keep_alive() # Start Flask
+    app_tg = Application.builder().token(BOT_TOKEN).build()
+    app_tg.add_handler(CommandHandler("start", start))
+    app_tg.add_handler(CallbackQueryHandler(button_handler))
+    app_tg.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    print("🤖 Bot is running...")
+    app_tg.run_polling()
+
 if __name__ == '__main__':
-    Thread(target=run_server, daemon=True).start()
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-    app.add_handler(ConversationHandler(
-        entry_points=[CommandHandler("upload", start_upload)],
-        states={GET_FILE: [MessageHandler(filters.Document.ALL, receive_file)],
-                GET_QUALITY: [CallbackQueryHandler(receive_quality)],
-                GET_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_name)]},
-        fallbacks=[CommandHandler("cancel", lambda u,c: ConversationHandler.END)]
-    ))
-    app.run_polling()
+    main()
